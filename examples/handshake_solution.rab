@@ -1,0 +1,348 @@
+(********************)
+(** 1. Equational Theory *)
+
+(** 
+  Security primitives used in user programs 
+  should be declared here as an equational theory.
+
+  Not only cryptographic operations but also 
+  basic constructs like projections from pairs 
+  can be defined as part of the theory. For example:
+*)
+
+function fst:1
+function snd:1
+equation fst((x, y)) = x
+equation snd((x, y)) = y
+
+(**
+  Here, (-, -) denotes the language's pairing construct. 
+  The functions `fst` and `snd`, along with their behavior, 
+  are not built-in but are defined in the equational theory.
+
+  Let us define an equational theory for symmetric encryption and decryption:
+*)
+
+function senc:2
+function sdec:2
+equation sdec(senc(x, y), y) = x
+
+
+(********************)
+(** 2. System Calls *)
+
+(**
+  Rabbit does not provide any built-in system calls. Any system calls
+  can be defined by users as global-level functions.
+
+  The syntax for defining a system call is:
+
+  ```rab
+  syscall syscall_name(x, ..., z) {
+    c
+  }
+  ```
+
+  where `c` is a command in our command language.
+
+  Let us define system calls for UDP communications.
+*)
+
+syscall recv(ch){
+  case [ ch::store(v) ] -> v end
+}
+
+syscall send(ch, v){
+  put [ ch::store(v) ]
+}
+
+(** 
+  Opening and reading files require a "file descriptor" to be stored locally 
+  in process memory. To this end, it is recommended to use structure commands:
+*)
+
+syscall open(p){
+	case [ p.d ] -> 
+	  put [p.d]; 
+	  new x = Fd(d) in 
+	  x
+	end
+}
+
+syscall read (y){
+  let x = y.Fd in
+  x
+}
+
+syscall close(x){
+	delete x.Fd
+}
+
+
+(********************)
+(** 3. Types and Access Control *)
+
+(** 
+  Define types of processes, channels, and files, and access policies:
+*)
+
+type client_ty : process
+type server_ty : process
+type udp_ty : channel
+type readonly_ty : filesys
+
+allow client_ty udp_ty [recv, send]
+allow server_ty udp_ty [recv, send]
+
+allow client_ty readonly_ty [open, read, close]
+allow server_ty readonly_ty [open, read, close]
+
+
+(********************)
+(** 4. Attacks *)
+
+(** 
+  Passive attacks are defined as system calls. We define an attack and
+  invoke it in the user program.
+*)
+
+passive attack eaves_mem (v) {
+	put [::Out(v)]
+}
+
+(** 
+  Active attacks include eavesdropping, tampering, and injecting. 
+  These are defined as attacks on system calls:
+*)
+
+attack eaves_channel on send (c, v) {
+  put [c::store(v), ::Out(v)]
+}
+
+attack inject_channel on recv (c) {
+	case [::In(v)] -> v end
+}
+
+allow client_ty [eaves_mem]
+allow server_ty [eaves_mem]
+allow attack client_ty [inject_channel] 
+allow attack server_ty [inject_channel] 
+
+
+(********************)
+(** 5. Channels and Global Constants *)
+
+(** 
+  Install a channel for UDP and a fresh global constant 
+  for a symmetric key shared between processes.
+*)
+
+channel udp_ch : udp_ty
+const fresh sym_k
+
+
+(********************)
+(** 6. Process Templates *)
+
+(**
+  We will define several client and server templates.
+
+  [1] Define process templates for a client and a server that
+      perform a single message exchange.
+*)
+
+process client1 (ch : udp_ty) : client_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);
+  	var n = recv(ch) in
+  	new msg in
+  	event [::Send(msg)];
+  	_ := send(ch, senc((msg, n), k))
+
+  }
+}
+
+process server1 (ch : udp_ty) : server_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);
+
+  	new n in
+	_ := send(ch, n); 
+	var r = recv(ch) in
+	case 
+	  [snd (sdec(r, sym_k))  = n] -> event [::Valid(fst (sdec(r, sym_k)))]
+	| [snd (sdec(r, sym_k)) != n] -> event [::InValid()]
+	end
+  }
+}
+
+(**
+  [2] Version where server sends a nonce upon request from the client:
+*)
+
+syscall get_nonce (ch){
+	put [ch::req()];
+	case [ch::ack(n)] -> n end
+}
+
+syscall responds_with_value (ch, v){
+  case [ch::req()] -> 
+    put [ch::ack(v)]
+  end
+}
+
+allow client_ty udp_ty [get_nonce]
+allow server_ty udp_ty [responds_with_value]
+
+process client2 (ch : udp_ty) : client_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);
+
+  	var n = get_nonce (ch) in
+  	new msg in
+  	event [::Send(msg)];
+  	_ := send(ch, senc((msg, n), sym_k))
+
+  }
+}
+
+process server2 (ch : udp_ty) : server_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);  	
+
+  	new n in
+  	_ := responds_with_value(ch, n);
+    var r = recv(ch) in
+    case 
+      [snd (sdec(r, k))  = n] -> event [::Valid(fst (sdec(r, k)))]
+    | [snd (sdec(r, k)) != n] -> event [::InValid()]
+    end
+  }
+}
+
+(**
+  [3] Version where client and server loop unboundedly many times,  
+      server reuses the same nonce for each loop, 
+  	  for each loop a fresh session id is assigned, 
+  	  and in the events, the session id is tagged as well.
+*)
+
+process client3 (ch : udp_ty) : client_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);  	
+
+  	repeat 
+  	[] ->
+  	  var n = get_nonce (ch) in
+  	  new msg in
+  	  event [::Send((msg, snd(n)))];
+  	  _ := send(ch, senc((msg, fst(n)), k))
+  	until
+  	[] -> event [::ClientTerminate()]
+    end 
+  }
+}
+
+process server3 (ch : udp_ty) : server_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);  	
+
+  	new n in
+  	repeat [] ->
+  	  new sid in
+      _ := responds_with_value(ch, (n, sid));
+      var r = recv(ch) in
+      case 
+        [snd (sdec(r, k))  = n] -> event [::Valid((fst (sdec(r, k)), sid))]
+      | [snd (sdec(r, k)) != n] -> event [::InValid()]
+      end
+    until ["1"="2"] -> skip
+    end
+  }
+}
+
+(**
+  [4] Version where the server generates a fresh nonce each session.
+*)
+
+process client4 (ch : udp_ty) : client_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);  	
+
+  	repeat 
+  	[] ->
+  	  var n = get_nonce (ch) in
+  	  new msg in
+  	  event [::Send((msg, snd(n)))];
+  	  _ := send(ch, senc((msg, fst(n)), k))
+  	until
+  	[] -> event [::ClientTerminate()]
+    end 
+  }
+}
+
+process server4 (ch : udp_ty) : server_ty {
+  file "key" : readonly_ty = sym_k
+  
+  main {
+  	var f = open("key") in
+  	var k = read(f) in
+  	_ := close(f);  	
+
+  	repeat [] ->
+	  new n in
+  	  new sid in
+      _ := responds_with_value(ch, (n, sid));
+      var r = recv(ch) in
+      case 
+        [snd (sdec(r, k))  = n] -> event [::Valid((fst (sdec(r, k)), sid))]
+      | [snd (sdec(r, k)) != n] -> event [::InValid()]
+      end
+    until ["1"="2"] -> skip
+    end
+  }
+}
+
+
+(********************)
+(** 7. System and Assertions *)
+
+system client4 (udp_ch) | server4 (udp_ch)
+requires 
+[
+	lemma integrity : reachable ::Valid(x) ;
+	lemma failure : reachable ::InValid();
+	lemma authentication : corresponds ::Valid(x) ~> ::Send(x)
+]
+
+
+
+
